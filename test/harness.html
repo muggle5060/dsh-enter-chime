@@ -21,10 +21,15 @@
 // ---- loader + browser stubs, installed before the plugin script -------------
 window.__loaded = [];
 window.__ModuleLoader__ = { load(registration) { window.__loaded.push(registration); } };
-// A background/occluded tab freezes real animation frames; drive them from a timer
-// so every case runs deterministically here.
+// A background/occluded tab freezes real animation frames and clamps setTimeout
+// to once per minute, so both the harness and the plugin's rAF path are driven
+// from a MessageChannel, which hidden pages do not throttle.
+const channel = new MessageChannel();
+const soonQueue = [];
+channel.port1.onmessage = () => { const next = soonQueue.shift(); if (next) next(); };
+function soon(callback) { soonQueue.push(callback); channel.port2.postMessage(null); }
 window.__nativeRaf = window.requestAnimationFrame;
-window.requestAnimationFrame = (callback) => setTimeout(() => callback(performance.now()), 0);
+window.requestAnimationFrame = (callback) => { soon(() => callback(performance.now())); };
 
 let oscillatorCount = 0;
 let notificationCount = 0;
@@ -41,7 +46,12 @@ window.AudioContext = FakeAudioContext;
 class FakeNotification { constructor(title, options) { notificationCount += 1; lastNotification = { title, body: options?.body ?? null }; } }
 FakeNotification.permission = "granted";
 window.Notification = FakeNotification;
-document.hasFocus = () => false;
+// Window focus is a switch the tests flip; notifications only fire while unfocused.
+// The harness window itself is usually minimized, which would pin visibilityState to
+// "hidden", so it is derived from the same switch.
+let focused = false;
+document.hasFocus = () => focused;
+Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (focused ? "visible" : "hidden") });
 </script>
 
 <script src="../lib/client.js"></script>
@@ -58,7 +68,7 @@ function flush() {
     `\n\n${lines.length - failed}/${lines.length} passed`;
   window.__report = { lines, failed, total: lines.length };
 }
-const tick = () => new Promise((resolve) => setTimeout(resolve, 25));
+const tick = () => new Promise((resolve) => soon(resolve));
 async function until(check, timeoutMs = 2000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -73,13 +83,16 @@ const panel = document.getElementById("panel");
 let allowClicks = 0;
 let rejectClicks = 0;
 let answerable = true;
+/** Every render is a new pending approval, exactly as the real panel keys them. */
+let panelSeq = 0;
 
 function renderPanel() {
   allowClicks = 0;
   rejectClicks = 0;
   answerable = true;
+  panelSeq += 1;
   panel.innerHTML = `
-    <div class="j_8BDW_root" data-approval-key="approval:1" aria-busy="false" tabindex="-1">
+    <div class="j_8BDW_root" data-approval-key="approval:${panelSeq}" aria-busy="false" tabindex="-1">
       <div class="j_8BDW_card">
         <div class="j_8BDW_strip">等待审批</div>
         <div class="j_8BDW_body" data-approval-scroll="" tabindex="0" role="group" aria-label="审批详情">
@@ -176,6 +189,8 @@ async function main() {
   const harness = makeCtx();
   moduleExports.apply(harness.ctx);
   record(typeof window.__dshEnterChime === "object", "03 debug handle published");
+  /* Cases 04-11 are about the Enter binding; alerting gets its own cases at the end. */
+  window.__dshEnterChime.setPrefs({ approvalAlert: false });
 
   // 04 nothing pending: Enter is left alone
   pressOn(document.body, "Enter");
@@ -277,6 +292,58 @@ async function main() {
   harness.setRunning("session-1", true);
   harness.setRunning("session-1", false, false);
   record(["回答已完成", "Reply finished"].includes(lastNotification?.body), "20 previous turns are not reused for a text-less turn", JSON.stringify(lastNotification?.body));
+
+  // 21 an unseen approval is announced: cue + toast carrying the panel headline
+  window.__dshEnterChime.setPrefs({ approvalAlert: true, notify: true, chime: true });
+  focused = false;
+  const alertOscillators = oscillatorCount;
+  renderPanel();
+  const announced = await until(() => oscillatorCount > alertOscillators);
+  const alertBody = lastNotification?.body ?? "";
+  record(announced && notificationCount > 0, "21 an unfocused approval alerts", `oscillators=+${oscillatorCount - alertOscillators}`);
+  record(alertBody.includes("工具 pwsh 请求越权执行") && /Enter/.test(alertBody), "22 the alert body carries the panel headline and the Enter hint", JSON.stringify(alertBody));
+  record(["等待审批", "Approval waiting"].includes(lastNotification?.title), "23 the alert keeps the approval title", JSON.stringify(lastNotification?.title));
+
+  // 24 the same unanswered prompt is announced once
+  const alertCalls = notificationCount;
+  const alertOsc = oscillatorCount;
+  window.dispatchEvent(new Event("blur"));
+  await tick();
+  record(notificationCount === alertCalls && oscillatorCount === alertOsc, "24 an already announced prompt stays quiet", `notifications=${notificationCount - alertCalls}`);
+
+  // 25 a focused window is showing the panel itself, so nothing interrupts
+  focused = true;
+  const focusedOsc = oscillatorCount;
+  const focusedNotifications = notificationCount;
+  renderPanel();
+  await tick();
+  await tick();
+  record(oscillatorCount === focusedOsc && notificationCount === focusedNotifications, "25 a focused window is not interrupted", `oscillators=+${oscillatorCount - focusedOsc}`);
+
+  // 26 leaving the window with the prompt still unanswered is what reminds
+  focused = false;
+  const leftOsc = oscillatorCount;
+  window.dispatchEvent(new Event("blur"));
+  await until(() => oscillatorCount > leftOsc);
+  record(oscillatorCount > leftOsc, "26 leaving the window reminds about the pending prompt", `oscillators=+${oscillatorCount - leftOsc}`);
+
+  // 27 approvalAlert off silences both cue and toast
+  window.__dshEnterChime.setPrefs({ approvalAlert: false });
+  const offOsc = oscillatorCount;
+  const offNotifications = notificationCount;
+  renderPanel();
+  await tick();
+  await tick();
+  record(oscillatorCount === offOsc && notificationCount === offNotifications, "27 approvalAlert:false silences the prompt alert");
+
+  // 28 notify off keeps the cue, drops the toast
+  window.__dshEnterChime.setPrefs({ approvalAlert: true, notify: false });
+  const cueOsc = oscillatorCount;
+  const cueNotifications = notificationCount;
+  renderPanel();
+  await until(() => oscillatorCount > cueOsc);
+  record(oscillatorCount > cueOsc && notificationCount === cueNotifications, "28 notify:false keeps the cue without a toast", `oscillators=+${oscillatorCount - cueOsc}`);
+  window.__dshEnterChime.setPrefs({ notify: true });
 
   flush();
 }
