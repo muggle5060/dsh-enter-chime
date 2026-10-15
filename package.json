@@ -1,0 +1,55 @@
+{
+  "name": "dsh-enter-chime",
+  "version": "0.1.0",
+  "description": "Enter approves a pending DeepSeek Harness approval without clicking, and a chime plus desktop notification lands when the reply finishes.",
+  "license": "MIT",
+  "author": "muggle5060",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "approval",
+    "keyboard-shortcut",
+    "notification",
+    "sound",
+    "web-audio"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muggle5060/dsh-enter-chime.git"
+  },
+  "homepage": "https://github.com/muggle5060/dsh-enter-chime#readme",
+  "bugs": {
+    "url": "https://github.com/muggle5060/dsh-enter-chime/issues"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [],
+      "immediately": true
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  }
+}

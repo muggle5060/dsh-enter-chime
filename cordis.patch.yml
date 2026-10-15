@@ -1,0 +1,8 @@
+# dsh-enter-chime bundle patch
+#
+# Mounted as a profile bundle: the loader inserts one plugin row, whose Node
+# half is this package's `main` and whose browser half is `exports["./client"]`
+# (declared through `dsh.client`).
+- insert:
+    - id: enter-chime
+      name: 'dsh-enter-chime'

@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>dsh-enter-chime harness</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Consolas, monospace; margin: 16px; }
+  #out { white-space: pre-wrap; }
+  .pass { color: #067d17; }
+  .fail { color: #b4001e; font-weight: 700; }
+  .case { padding: 8px; border: 1px solid #ddd; border-radius: 8px; max-width: 460px; }
+  button { font: inherit; }
+</style>
+</head>
+<body>
+<h3>dsh-enter-chime client-half harness</h3>
+<div id="panel" class="case"></div>
+<pre id="out">running…</pre>
+
+<script>
+// ---- loader + browser stubs, installed before the plugin script -------------
+window.__loaded = [];
+window.__ModuleLoader__ = { load(registration) { window.__loaded.push(registration); } };
+// A background/occluded tab freezes real animation frames; drive them from a timer
+// so every case runs deterministically here.
+window.__nativeRaf = window.requestAnimationFrame;
+window.requestAnimationFrame = (callback) => setTimeout(() => callback(performance.now()), 0);
+
+let oscillatorCount = 0;
+let notificationCount = 0;
+class FakeGain { constructor() { this.gain = { setValueAtTime() {}, exponentialRampToValueAtTime() {}, linearRampToValueAtTime() {} }; } connect() {} }
+class FakeOscillator { constructor() { oscillatorCount += 1; this.frequency = { value: 0 }; this.type = "sine"; } connect() {} start() {} stop() {} }
+class FakeAudioContext {
+  constructor() { this.state = "running"; this.currentTime = 0; this.destination = {}; }
+  createOscillator() { return new FakeOscillator(); }
+  createGain() { return new FakeGain(); }
+  resume() { this.state = "running"; return Promise.resolve(); }
+}
+window.AudioContext = FakeAudioContext;
+class FakeNotification { constructor() { notificationCount += 1; } }
+FakeNotification.permission = "granted";
+window.Notification = FakeNotification;
+document.hasFocus = () => false;
+</script>
+
+<script src="../lib/client.js"></script>
+
+<script>
+const lines = [];
+function record(ok, name, detail) {
+  lines.push(`${ok ? "PASS" : "FAIL"}  ${name}${detail === undefined ? "" : "  — " + detail}`);
+}
+function flush() {
+  const failed = lines.filter((line) => line.startsWith("FAIL")).length;
+  document.getElementById("out").innerHTML =
+    lines.map((line) => `<span class="${line.startsWith("FAIL") ? "fail" : "pass"}">${line}</span>`).join("\n") +
+    `\n\n${lines.length - failed}/${lines.length} passed`;
+  window.__report = { lines, failed, total: lines.length };
+}
+const tick = () => new Promise((resolve) => setTimeout(resolve, 25));
+async function until(check, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (check()) return true;
+    if (Date.now() > deadline) return false;
+    await tick();
+  }
+}
+
+// ---- fake approval panel, mirroring the real markup ------------------------
+const panel = document.getElementById("panel");
+let allowClicks = 0;
+let rejectClicks = 0;
+let answerable = true;
+
+function renderPanel() {
+  allowClicks = 0;
+  rejectClicks = 0;
+  answerable = true;
+  panel.innerHTML = `
+    <div class="j_8BDW_root" data-approval-key="approval:1" aria-busy="false" tabindex="-1">
+      <div class="j_8BDW_card">
+        <div class="j_8BDW_strip">等待审批</div>
+        <div class="j_8BDW_body" data-approval-scroll="" tabindex="0" role="group" aria-label="审批详情">
+          <div class="j_8BDW_headline">工具 pwsh 请求越权执行</div>
+        </div>
+        <div class="j_8BDW_actionRow">
+          <button type="button" id="reject">拒绝</button>
+          <button type="button" id="allow">允许一次</button>
+        </div>
+      </div>
+    </div>`;
+  const root = panel.firstElementChild;
+  root.querySelector("#reject").addEventListener("click", () => {
+    rejectClicks += 1;
+    answerable = false;
+    root.setAttribute("aria-busy", "true");
+    root.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  });
+  root.querySelector("#allow").addEventListener("click", () => {
+    allowClicks += 1;
+    answerable = false;
+    root.setAttribute("aria-busy", "true");
+    root.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  });
+  // The real panel answers Enter itself while focus is inside it.
+  root.addEventListener("keydown", (event) => {
+    const element = event.target;
+    if (event.defaultPrevented || !event.currentTarget.contains(document.activeElement)) return;
+    if (element.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]') !== null) return;
+    if (event.key !== "Enter" && event.key !== "Escape") return;
+    if (event.key === "Enter" && element.closest('button, a[href], [role="button"]') !== null) return;
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat || event.isComposing) return;
+    (event.key === "Enter" ? root.querySelector("#allow") : root.querySelector("#reject")).click();
+  });
+  return root;
+}
+
+function pressOn(target, key, modifiers = {}) {
+  target.dispatchEvent(new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true, ...modifiers }));
+}
+
+// ---- fake ctx --------------------------------------------------------------
+function makeCtx() {
+  const statusListeners = new Set();
+  const snapshot = new Map();
+  const status = {
+    getSnapshot: () => snapshot,
+    subscribe(listener) { statusListeners.add(listener); return () => statusListeners.delete(listener); }
+  };
+  const cleanups = [];
+  const uiSession = { sessionStatus: status };
+  const effect = (fn) => { const off = fn(); if (typeof off === "function") cleanups.push(off); return off; };
+  const ctx = {
+    effect,
+    inject(names, callback) {
+      if (names.includes("uiSession")) callback({ uiSession, effect });
+    },
+    get: () => undefined,
+    dispose() { for (const off of cleanups) off(); cleanups.length = 0; }
+  };
+  return {
+    ctx,
+    uiSession,
+    setRunning(id, running, completionUnread = false) {
+      snapshot.set(id, { running, pendingInteraction: undefined, completionUnread });
+      for (const listener of [...statusListeners]) listener();
+    }
+  };
+}
+
+async function main() {
+  window.localStorage.removeItem("dsh.enter-chime.v1");
+  // 01 registration
+  const registration = window.__loaded[0];
+  record(registration !== undefined && registration.id === "dsh-enter-chime", "01 module registers under its package id", registration?.id);
+  if (registration === undefined) return flush();
+  const moduleExports = registration.factory(() => { throw new Error("harness: unexpected require()"); });
+  record(typeof moduleExports.apply === "function" && Array.isArray(moduleExports.inject), "02 factory exports apply() + inject[]", `inject=[${moduleExports.inject}]`);
+
+  const harness = makeCtx();
+  moduleExports.apply(harness.ctx);
+  record(typeof window.__dshEnterChime === "object", "03 debug handle published");
+
+  // 04 nothing pending: Enter is left alone
+  pressOn(document.body, "Enter");
+  record(allowClicks === 0 && rejectClicks === 0, "04 Enter with no pending panel does nothing");
+
+  // 05 panel appears -> focus moves into it
+  const root = renderPanel();
+  const grabbed = await until(() => root.contains(document.activeElement));
+  record(grabbed, "05 panel grabs focus on appear", document.activeElement?.className || document.activeElement?.tagName);
+
+  // 06 the real panel handler answers Enter while it holds focus, exactly once
+  pressOn(document.activeElement, "Enter");
+  record(allowClicks === 1 && answerable === false, "06 Enter inside the focused panel answers once (native path)", `allow=${allowClicks}`);
+
+  // 07 panel pending while focus is elsewhere (the Codex case)
+  renderPanel();
+  await tick();
+  document.activeElement.blur();
+  pressOn(document.body, "Enter");
+  record(allowClicks === 1, "07 Enter with focus outside the panel still approves", `allow=${allowClicks}`);
+
+  // 08 an already answered panel is not answered twice
+  pressOn(document.body, "Enter");
+  record(allowClicks === 1, "08 a settled panel ignores further Enter", `allow=${allowClicks}`);
+
+  // 09 editable targets keep Enter
+  renderPanel();
+  await tick();
+  const probe = document.createElement("textarea");
+  document.body.appendChild(probe);
+  probe.focus();
+  pressOn(probe, "Enter");
+  record(allowClicks === 0, "09 Enter inside a text field is never hijacked", `allow=${allowClicks}`);
+  probe.remove();
+
+  // 10 modifiers keep their own meaning
+  document.activeElement.blur();
+  pressOn(document.body, "Enter", { ctrlKey: true });
+  pressOn(document.body, "Enter", { shiftKey: true });
+  record(allowClicks === 0, "10 Ctrl/Shift+Enter are not approvals", `allow=${allowClicks}`);
+
+  // 11 preference switch
+  window.__dshEnterChime.setPrefs({ enter: false });
+  pressOn(document.body, "Enter");
+  record(allowClicks === 0, "11 enter:false disables the binding", `allow=${allowClicks}`);
+  window.__dshEnterChime.setPrefs({ enter: true });
+
+  // 12 completion chime on the main session
+  const before = oscillatorCount;
+  harness.setRunning("session-1", true);
+  harness.setRunning("session-1", false, false);
+  record(oscillatorCount > before, "12 running true->false on the main session chimes", `oscillators=${oscillatorCount - before}`);
+  record(notificationCount === 1, "13 background completion raises a notification", `notifications=${notificationCount}`);
+
+  // 14 a background session that is marked unread stays silent
+  const beforeUnread = oscillatorCount;
+  harness.setRunning("session-2", true);
+  harness.setRunning("session-2", false, true);
+  record(oscillatorCount === beforeUnread, "14 unread (non-main) completion stays silent");
+
+  // 15 chime preference
+  window.__dshEnterChime.setPrefs({ chime: false, notify: false });
+  const beforeOff = oscillatorCount;
+  harness.setRunning("session-1", true);
+  harness.setRunning("session-1", false, false);
+  record(oscillatorCount === beforeOff, "15 chime:false silences the cue");
+  window.__dshEnterChime.setPrefs({ chime: true, notify: true });
+
+  flush();
+}
+
+main().catch((error) => {
+  record(false, "harness threw", String(error && error.stack || error));
+  flush();
+});
+</script>
+</body>
+</html>
