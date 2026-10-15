@@ -28,6 +28,7 @@ window.requestAnimationFrame = (callback) => setTimeout(() => callback(performan
 
 let oscillatorCount = 0;
 let notificationCount = 0;
+let lastNotification = null;
 class FakeGain { constructor() { this.gain = { setValueAtTime() {}, exponentialRampToValueAtTime() {}, linearRampToValueAtTime() {} }; } connect() {} }
 class FakeOscillator { constructor() { oscillatorCount += 1; this.frequency = { value: 0 }; this.type = "sine"; } connect() {} start() {} stop() {} }
 class FakeAudioContext {
@@ -37,7 +38,7 @@ class FakeAudioContext {
   resume() { this.state = "running"; return Promise.resolve(); }
 }
 window.AudioContext = FakeAudioContext;
-class FakeNotification { constructor() { notificationCount += 1; } }
+class FakeNotification { constructor(title, options) { notificationCount += 1; lastNotification = { title, body: options?.body ?? null }; } }
 FakeNotification.permission = "granted";
 window.Notification = FakeNotification;
 document.hasFocus = () => false;
@@ -133,11 +134,21 @@ function makeCtx() {
   };
   const cleanups = [];
   const uiSession = { sessionStatus: status };
+  // Session object layer stub: a borrowed binding whose visible window the test drives.
+  const sessions = {
+    entries: [],
+    binding() {
+      return { eventSource: { getSnapshot: () => ({ entries: sessions.entries, hasMore: false, revision: 1, change: { kind: "replace", entries: sessions.entries } }) } };
+    }
+  };
   const effect = (fn) => { const off = fn(); if (typeof off === "function") cleanups.push(off); return off; };
   const ctx = {
     effect,
     inject(names, callback) {
-      if (names.includes("uiSession")) callback({ uiSession, effect });
+      const scope = { effect };
+      if (names.includes("uiSession")) scope.uiSession = uiSession;
+      if (names.includes("sessions")) scope.sessions = sessions;
+      callback(scope);
     },
     get: () => undefined,
     dispose() { for (const off of cleanups) off(); cleanups.length = 0; }
@@ -145,6 +156,7 @@ function makeCtx() {
   return {
     ctx,
     uiSession,
+    sessions,
     setRunning(id, running, completionUnread = false) {
       snapshot.set(id, { running, pendingInteraction: undefined, completionUnread });
       for (const listener of [...statusListeners]) listener();
@@ -212,25 +224,59 @@ async function main() {
   window.__dshEnterChime.setPrefs({ enter: true });
 
   // 12 completion chime on the main session
+  harness.sessions.entries = [{ event: { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "已完成：**改好了**，见 `lib/client.js`。" }] } } } }];
   const before = oscillatorCount;
   harness.setRunning("session-1", true);
   harness.setRunning("session-1", false, false);
   record(oscillatorCount > before, "12 running true->false on the main session chimes", `oscillators=${oscillatorCount - before}`);
-  record(notificationCount === 1, "13 background completion raises a notification", `notifications=${notificationCount}`);
 
-  // 14 a background session that is marked unread stays silent
+  // 13 the toast body is the reply itself, markdown stripped
+  record(notificationCount === 1, "13 background completion raises a notification", `notifications=${notificationCount}`);
+  record(lastNotification?.body === "已完成：改好了，见 lib/client.js。", "14 notification body carries the reply text", JSON.stringify(lastNotification?.body));
+
+  // 15 durable-stream fallback when the assembled message has no text blocks
+  harness.sessions.entries = [{ event: { type: "assistant/message", data: { message: { role: "assistant", content: [] }, stream: [{ type: "text-chunks", time0: 0, index: 0, dt: [], texts: ["流式", "回退文本"] }] } } }];
+  harness.setRunning("session-1", true);
+  harness.setRunning("session-1", false, false);
+  record(lastNotification?.body === "流式回退文本", "15 stream records supply the body when content is empty", JSON.stringify(lastNotification?.body));
+
+  // 16 no assistant message at all -> localized fallback copy
+  harness.sessions.entries = [];
+  harness.setRunning("session-1", true);
+  harness.setRunning("session-1", false, false);
+  record(["回答已完成", "Reply finished"].includes(lastNotification?.body), "16 empty turn falls back to the canned copy", JSON.stringify(lastNotification?.body));
+
+  // 17 long replies are capped
+  const capped = window.__dshEnterChime.preview("字".repeat(500));
+  record(capped.length === 180 && capped.endsWith("…"), "17 preview caps long replies", `len=${capped.length}`);
+
+  // 18 a background session that is marked unread stays silent
   const beforeUnread = oscillatorCount;
+  const notificationsUnread = notificationCount;
   harness.setRunning("session-2", true);
   harness.setRunning("session-2", false, true);
-  record(oscillatorCount === beforeUnread, "14 unread (non-main) completion stays silent");
+  record(oscillatorCount === beforeUnread && notificationCount === notificationsUnread, "18 unread (non-main) completion stays silent");
 
-  // 15 chime preference
+  // 19 chime preference
   window.__dshEnterChime.setPrefs({ chime: false, notify: false });
   const beforeOff = oscillatorCount;
   harness.setRunning("session-1", true);
   harness.setRunning("session-1", false, false);
-  record(oscillatorCount === beforeOff, "15 chime:false silences the cue");
+  record(oscillatorCount === beforeOff, "19 chime:false silences the cue");
   window.__dshEnterChime.setPrefs({ chime: true, notify: true });
+
+  // 20 an earlier turn's reply is never reused for a text-less turn
+  harness.sessions.entries = [
+    { event: { type: "turn/start", data: { turn: 1 } } },
+    { event: { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "上一轮的回答" }] } } } },
+    { event: { type: "turn/end", data: { turn: 1, reason: { kind: "stop" } } } },
+    { event: { type: "turn/start", data: { turn: 2 } } },
+    { event: { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "tool-call" }] }, stream: [] } } },
+    { event: { type: "turn/end", data: { turn: 2, reason: { kind: "stop" } } } }
+  ];
+  harness.setRunning("session-1", true);
+  harness.setRunning("session-1", false, false);
+  record(["回答已完成", "Reply finished"].includes(lastNotification?.body), "20 previous turns are not reused for a text-less turn", JSON.stringify(lastNotification?.body));
 
   flush();
 }
